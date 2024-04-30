@@ -22,7 +22,8 @@ import {FileSystemFileEntry, NgxFileDropEntry} from 'ngx-file-drop';
 import {HttpClient} from '@angular/common/http';
 import {NgbModal} from '@ng-bootstrap/ng-bootstrap';
 import {delay} from 'rxjs/operators';
-import {FormBuilder, FormGroup, Validators} from '@angular/forms';
+import {UntypedFormBuilder, UntypedFormGroup, Validators} from '@angular/forms';
+import {DeleteConfirmService} from '../shared/delete-confirm.service';
 
 @Component({
   templateUrl: './config.component.html',
@@ -40,7 +41,7 @@ export class ConfigComponent implements OnInit, OnDestroy {
   public uploadSuccess = false;
   public deleteSuccess = false;
   public deleting = false;
-  public confirmDeleteForm: FormGroup;
+  public confirmDeleteForm: UntypedFormGroup;
 
   private apiConfig: ConfigParams;
 
@@ -50,7 +51,8 @@ export class ConfigComponent implements OnInit, OnDestroy {
     private readonly httpClient: HttpClient,
     private readonly modalService: NgbModal,
     private readonly consoleService: ConsoleService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
+    private readonly deleteConfirmService: DeleteConfirmService,
   ) {
     this.apiConfig = config;
   }
@@ -153,24 +155,25 @@ export class ConfigComponent implements OnInit, OnDestroy {
   }
 
   public deleteData(): void {
-    this.deleteError = '';
-    this.deleting = true;
-    this.consoleService.deleteAccounts('').pipe(delay(2000)).subscribe(
+    this.deleteConfirmService.openDeleteConfirmModal(
       () => {
-        this.deleting = false;
         this.deleteError = '';
-        this.deleteSuccess = true;
-      }, err => {
-        this.deleting = false;
-        this.deleteError = err;
+        this.deleting = true;
+        this.consoleService.deleteAllData('').pipe(delay(2000)).subscribe(
+          () => {
+            this.deleting = false;
+            this.deleteError = '';
+            this.deleteSuccess = true;
+          }, err => {
+            this.deleting = false;
+            this.deleteError = err;
+          },
+        );
       },
+      this.confirmDeleteForm,
+      'Delete All Data' ,
+     'Are you sure you want to delete all the database data?'
     );
-  }
-
-  public openDeleteDataModal(modal): void {
-    this.modalService.open(modal, {centered: true}).result.then(() => {
-      this.deleteData();
-    }, () => {});
   }
 
   get f(): any {

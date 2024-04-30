@@ -13,10 +13,11 @@
 // limitations under the License.
 
 import {Component, Injectable, OnInit} from '@angular/core';
-import {FormBuilder, FormGroup, Validators} from '@angular/forms';
+import {UntypedFormBuilder, UntypedFormGroup, Validators} from '@angular/forms';
 import {ActivatedRoute, ActivatedRouteSnapshot, CanActivate, Router, RouterStateSnapshot} from '@angular/router';
 import {AuthenticationService} from '../authentication.service';
 import {SegmentService} from 'ngx-segment-analytics';
+import {environment} from "../../environments/environment";
 
 @Component({
   templateUrl: './login.component.html',
@@ -24,20 +25,22 @@ import {SegmentService} from 'ngx-segment-analytics';
 })
 export class LoginComponent implements OnInit {
   public error = '';
-  public loginForm!: FormGroup;
+  public loginForm!: UntypedFormGroup;
   public submitted!: boolean;
   private returnUrl!: string;
 
   constructor(
     private segment: SegmentService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
     private readonly route: ActivatedRoute,
     private readonly router: Router,
     private readonly authenticationService: AuthenticationService
   ) {}
 
   ngOnInit(): void {
-    this.segment.page('/login');
+    if (!environment.nt) {
+      this.segment.page('/login');
+    }
     this.loginForm = this.formBuilder.group({
       username: ['', Validators.compose([Validators.required])],
       password: ['', Validators.compose([Validators.required, Validators.minLength(8)])],

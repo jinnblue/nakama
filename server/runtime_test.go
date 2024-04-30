@@ -17,16 +17,16 @@ package server
 import (
 	"context"
 	"errors"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"fmt"
-
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"golang.org/x/crypto/bcrypt"
@@ -61,15 +61,26 @@ print("Test Module Loaded")
 return test`
 )
 
+type testRuntimeData struct {
+	leaderboardCache     LeaderboardCache
+	leaderboardRankCache LeaderboardRankCache
+}
+
 func runtimeWithModules(t *testing.T, modules map[string]string) (*Runtime, *RuntimeInfo, error) {
-	dir, err := ioutil.TempDir("", fmt.Sprintf("nakama_runtime_lua_test_%v", uuid.Must(uuid.NewV4()).String()))
+	rt, info, _, err := runtimeWithModulesWithData(t, modules)
+
+	return rt, info, err
+}
+
+func runtimeWithModulesWithData(t *testing.T, modules map[string]string) (*Runtime, *RuntimeInfo, *testRuntimeData, error) {
+	dir, err := os.MkdirTemp("", fmt.Sprintf("nakama_runtime_lua_test_%v", uuid.Must(uuid.NewV4()).String()))
 	if err != nil {
 		t.Fatalf("Failed initializing runtime modules tempdir: %s", err.Error())
 	}
 	defer os.RemoveAll(dir)
 
 	for moduleName, moduleData := range modules {
-		if err := ioutil.WriteFile(filepath.Join(dir, fmt.Sprintf("%v.lua", moduleName)), []byte(moduleData), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%v.lua", moduleName)), []byte(moduleData), 0o644); err != nil {
 			t.Fatalf("Failed initializing runtime modules tempfile: %s", err.Error())
 		}
 	}
@@ -77,7 +88,25 @@ func runtimeWithModules(t *testing.T, modules map[string]string) (*Runtime, *Run
 	cfg := NewConfig(logger)
 	cfg.Runtime.Path = dir
 
-	return NewRuntime(logger, logger, NewDB(t), protojsonMarshaler, protojsonUnmarshaler, cfg, nil, nil, nil, nil, nil, nil, nil, nil, metrics, nil, &DummyMessageRouter{})
+	ctx := context.Background()
+	db := NewDB(t)
+	lbCache := NewLocalLeaderboardCache(ctx, logger, logger, db)
+	lbRankCache := NewLocalLeaderboardRankCache(
+		ctx, logger, db, cfg.Leaderboard, lbCache)
+	lbSched := NewLocalLeaderboardScheduler(logger, db, cfg, lbCache, lbRankCache)
+
+	data := &testRuntimeData{
+		leaderboardCache:     lbCache,
+		leaderboardRankCache: lbRankCache,
+	}
+
+	sessionRegistry := NewLocalSessionRegistry(metrics)
+	tracker := &LocalTracker{sessionRegistry: sessionRegistry}
+	statusRegistry := NewLocalStatusRegistry(logger, cfg, sessionRegistry, protojsonMarshaler)
+
+	rt, rtInfo, err := NewRuntime(ctx, logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, "", nil, lbCache, lbRankCache, lbSched, sessionRegistry, nil, statusRegistry, nil, tracker, metrics, nil, &DummyMessageRouter{}, storageIdx, nil)
+
+	return rt, rtInfo, data, err
 }
 
 func TestRuntimeSampleScript(t *testing.T) {
@@ -320,7 +349,7 @@ nakama.register_rpc(test.printWorld, "helloworld")`,
 	}
 
 	payload := "Hello World"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
@@ -355,8 +384,10 @@ nakama.register_rpc(test.printWorld, "helloworld")`,
 
 	db := NewDB(t)
 	pipeline := NewPipeline(logger, cfg, db, protojsonMarshaler, protojsonUnmarshaler, nil, nil, nil, nil, nil, nil, nil, runtime)
-	apiServer := StartApiServer(logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, metrics, pipeline, runtime)
+	apiServer := StartApiServer(logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, "", nil, storageIdx, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, metrics, pipeline, runtime)
 	defer apiServer.Stop()
+
+	WaitForSocket(nil, cfg)
 
 	payload := "\"Hello World\""
 	client := &http.Client{}
@@ -367,7 +398,7 @@ nakama.register_rpc(test.printWorld, "helloworld")`,
 		t.Fatal(err)
 	}
 
-	b, err := ioutil.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,14 +409,20 @@ nakama.register_rpc(test.printWorld, "helloworld")`,
 }
 
 func TestRuntimeHTTPRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+
+	defer srv.Close()
+
 	modules := map[string]string{
-		"test": `
+		"test": fmt.Sprintf(`
 local nakama = require("nakama")
 function test(ctx, payload)
-	local success, code, headers, body = pcall(nakama.http_request, "http://httpbin.org/status/200", "GET", {})
+	local success, code, headers, body = pcall(nakama.http_request, "%s", "GET", {})
 	return tostring(code)
 end
-nakama.register_rpc(test, "test")`,
+nakama.register_rpc(test, "test")`, srv.URL),
 	}
 
 	runtime, _, err := runtimeWithModules(t, modules)
@@ -398,7 +435,7 @@ nakama.register_rpc(test, "test")`,
 		t.Fatal("Expected RPC function to be registered")
 	}
 
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", "")
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +466,7 @@ nakama.register_rpc(test, "test")`,
 	}
 
 	payload := "{\"key\":\"value\"}"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +497,7 @@ nakama.register_rpc(test, "test")`,
 	}
 
 	payload := "{\"key\":\"value\"}"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +528,7 @@ nakama.register_rpc(test, "test")`,
 	}
 
 	payload := "{\"key\":\"value\"}"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +559,7 @@ nakama.register_rpc(test, "test")`,
 	}
 
 	payload := "{\"key\":\"value\"}"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +616,7 @@ nakama.register_rpc(test, "test")`,
 	}
 
 	payload := "{\"key\":\"value\"}"
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", payload)
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +649,7 @@ nakama.register_rpc(test, "test")`,
 
 	payload := "something_to_encrypt"
 	hash, _ := bcrypt.GenerateFromPassword([]byte(payload), bcrypt.DefaultCost)
-	result, err, _ := fn(context.Background(), nil, "", "", nil, 0, "", "", "", string(hash))
+	result, err, _ := fn(context.Background(), nil, nil, "", "", nil, 0, "", "", "", "", string(hash))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,13 +666,13 @@ local nk = require("nakama")
 
 local subject = "You've unlocked level 100!"
 local content = {
-  reward_coins = 1000
+ reward_coins = 1000
 }
 local user_id = "4c2ae592-b2a7-445e-98ec-697694478b1c" -- who to send
 local code = 1
 
 local new_notifications = {
-  { subject = subject, content = content, user_id = user_id, code = code, persistent = false}
+ { subject = subject, content = content, user_id = user_id, code = code, persistent = false}
 }
 nk.notifications_send(new_notifications)`,
 	}
@@ -653,12 +690,32 @@ local nk = require("nakama")
 
 local subject = "You've unlocked level 100!"
 local content = {
-  reward_coins = 1000
+ reward_coins = 1000
 }
 local user_id = "4c2ae592-b2a7-445e-98ec-697694478b1c" -- who to send
 local code = 1
 
 nk.notification_send(user_id, subject, content, code, "", false)`,
+	}
+
+	_, _, err := runtimeWithModules(t, modules)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestRuntimeNotificationsDelete(t *testing.T) {
+	modules := map[string]string{
+		"test": `
+local nk = require("nakama")
+
+local user_id = "4c2ae592-b2a7-445e-98ec-697694478b1c"
+local notification_id = "3707b43c-60f0-4ba7-a94b-e21a028aeffb"
+
+local notifications = {
+  { user_id = user_id, notification_id = notification_id }
+}
+nk.notifications_delete(notifications)`,
 	}
 
 	_, _, err := runtimeWithModules(t, modules)
@@ -762,7 +819,6 @@ nakama.register_req_before(before_storage_write, "WriteStorageObjects")`,
 }`,
 		}},
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -839,7 +895,6 @@ nakama.register_req_after(after_storage_write, "WriteStorageObjects")`,
 }`,
 		}},
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -974,7 +1029,7 @@ local group = nk.group_create(user_id, group_name)
 assert(not (group.id == nil or group.id == ''), "'group.id' must not be nil")
 assert((group.name == group_name), "'group.name' must be set")
 
-nk.group_update(group.id, group_update_name)
+nk.group_update(group.id, user_id, group_update_name)
 
 local users = nk.group_users_list(group.id)
 for i, u in ipairs(users)

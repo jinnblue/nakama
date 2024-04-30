@@ -4,7 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/gofrs/uuid"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
@@ -13,10 +18,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"reflect"
-	"sort"
-	"strings"
-	"time"
 )
 
 type MethodName string

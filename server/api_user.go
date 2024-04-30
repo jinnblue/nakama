@@ -16,7 +16,8 @@ package server
 
 import (
 	"context"
-	"github.com/gofrs/uuid"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -63,7 +64,7 @@ func (s *ApiServer) GetUsers(ctx context.Context, in *api.GetUsersRequest) (*api
 		}
 	}
 
-	users, err := GetUsers(ctx, s.logger, s.db, s.tracker, ids, in.GetUsernames(), in.GetFacebookIds())
+	users, err := GetUsers(ctx, s.logger, s.db, s.statusRegistry, ids, in.GetUsernames(), in.GetFacebookIds())
 	if err != nil {
 		return nil, status.Error(codes.Internal, "Error retrieving user accounts.")
 	}

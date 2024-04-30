@@ -3,14 +3,13 @@ package parser
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/dop251/goja/ast"
 	"github.com/dop251/goja/file"
 	"github.com/dop251/goja/token"
 	"github.com/go-sourcemap/sourcemap"
-	"io/ioutil"
-	"net/url"
-	"path"
-	"strings"
 )
 
 func (self *_parser) parseBlockStatement() *ast.BlockStatement {
@@ -68,15 +67,25 @@ func (self *_parser) parseStatement() ast.Statement {
 		return self.parseVariableStatement()
 	case token.LET:
 		tok := self.peek()
-		if tok == token.LEFT_BRACKET || self.scope.allowLet && (tok == token.IDENTIFIER || tok == token.LET || tok == token.LEFT_BRACE) {
+		if tok == token.LEFT_BRACKET || self.scope.allowLet && (token.IsId(tok) || tok == token.LEFT_BRACE) {
 			return self.parseLexicalDeclaration(self.token)
 		}
 		self.insertSemicolon = true
 	case token.CONST:
 		return self.parseLexicalDeclaration(self.token)
+	case token.ASYNC:
+		if f := self.parseMaybeAsyncFunction(true); f != nil {
+			return &ast.FunctionDeclaration{
+				Function: f,
+			}
+		}
 	case token.FUNCTION:
 		return &ast.FunctionDeclaration{
-			Function: self.parseFunction(true),
+			Function: self.parseFunction(true, false, self.idx),
+		}
+	case token.CLASS:
+		return &ast.ClassDeclaration{
+			Class: self.parseClass(true),
 		}
 	case token.SWITCH:
 		return self.parseSwitchStatement()
@@ -128,17 +137,11 @@ func (self *_parser) parseTryStatement() ast.Statement {
 	if self.token == token.CATCH {
 		catch := self.idx
 		self.next()
-		var parameter *ast.Identifier
+		var parameter ast.BindingTarget
 		if self.token == token.LEFT_PARENTHESIS {
 			self.next()
-			if self.token != token.IDENTIFIER {
-				self.expect(token.IDENTIFIER)
-				self.nextStatement()
-				return &ast.BadStatement{From: catch, To: self.idx}
-			} else {
-				parameter = self.parseIdentifier()
-				self.expect(token.RIGHT_PARENTHESIS)
-			}
+			parameter = self.parseBindingTarget()
+			self.expect(token.RIGHT_PARENTHESIS)
 		}
 		node.Catch = &ast.CatchStatement{
 			Catch:     catch,
@@ -162,13 +165,21 @@ func (self *_parser) parseTryStatement() ast.Statement {
 
 func (self *_parser) parseFunctionParameterList() *ast.ParameterList {
 	opening := self.expect(token.LEFT_PARENTHESIS)
-	var list []*ast.Identifier
+	var list []*ast.Binding
+	var rest ast.Expression
+	if !self.scope.inFuncParams {
+		self.scope.inFuncParams = true
+		defer func() {
+			self.scope.inFuncParams = false
+		}()
+	}
 	for self.token != token.RIGHT_PARENTHESIS && self.token != token.EOF {
-		if self.token != token.IDENTIFIER {
-			self.expect(token.IDENTIFIER)
-		} else {
-			list = append(list, self.parseIdentifier())
+		if self.token == token.ELLIPSIS {
+			self.next()
+			rest = self.reinterpretAsDestructBindingTarget(self.parseAssignmentExpression())
+			break
 		}
+		self.parseVariableDeclaration(&list)
 		if self.token != token.RIGHT_PARENTHESIS {
 			self.expect(token.COMMA)
 		}
@@ -178,30 +189,49 @@ func (self *_parser) parseFunctionParameterList() *ast.ParameterList {
 	return &ast.ParameterList{
 		Opening: opening,
 		List:    list,
+		Rest:    rest,
 		Closing: closing,
 	}
 }
 
-func (self *_parser) parseParameterList() (list []string) {
-	for self.token != token.EOF {
-		if self.token != token.IDENTIFIER {
-			self.expect(token.IDENTIFIER)
-		}
-		list = append(list, self.literal)
+func (self *_parser) parseMaybeAsyncFunction(declaration bool) *ast.FunctionLiteral {
+	if self.peek() == token.FUNCTION {
+		idx := self.idx
 		self.next()
-		if self.token != token.EOF {
-			self.expect(token.COMMA)
-		}
+		return self.parseFunction(declaration, true, idx)
 	}
-	return
+	return nil
 }
 
-func (self *_parser) parseFunction(declaration bool) *ast.FunctionLiteral {
+func (self *_parser) parseFunction(declaration, async bool, start file.Idx) *ast.FunctionLiteral {
 
 	node := &ast.FunctionLiteral{
-		Function: self.expect(token.FUNCTION),
+		Function: start,
+		Async:    async,
+	}
+	self.expect(token.FUNCTION)
+
+	if self.token == token.MULTIPLY {
+		node.Generator = true
+		self.next()
 	}
 
+	if !declaration {
+		if async != self.scope.allowAwait {
+			self.scope.allowAwait = async
+			defer func() {
+				self.scope.allowAwait = !async
+			}()
+		}
+		if node.Generator != self.scope.allowYield {
+			self.scope.allowYield = node.Generator
+			defer func() {
+				self.scope.allowYield = !node.Generator
+			}()
+		}
+	}
+
+	self.tokenToBindingId()
 	var name *ast.Identifier
 	if self.token == token.IDENTIFIER {
 		name = self.parseIdentifier()
@@ -210,25 +240,217 @@ func (self *_parser) parseFunction(declaration bool) *ast.FunctionLiteral {
 		self.expect(token.IDENTIFIER)
 	}
 	node.Name = name
+
+	if declaration {
+		if async != self.scope.allowAwait {
+			self.scope.allowAwait = async
+			defer func() {
+				self.scope.allowAwait = !async
+			}()
+		}
+		if node.Generator != self.scope.allowYield {
+			self.scope.allowYield = node.Generator
+			defer func() {
+				self.scope.allowYield = !node.Generator
+			}()
+		}
+	}
+
 	node.ParameterList = self.parseFunctionParameterList()
-	self.parseFunctionBlock(node)
+	node.Body, node.DeclarationList = self.parseFunctionBlock(async, async, self.scope.allowYield)
 	node.Source = self.slice(node.Idx0(), node.Idx1())
 
 	return node
 }
 
-func (self *_parser) parseFunctionBlock(node *ast.FunctionLiteral) {
-	{
-		self.openScope()
-		inFunction := self.scope.inFunction
-		self.scope.inFunction = true
-		defer func() {
-			self.scope.inFunction = inFunction
-			self.closeScope()
-		}()
-		node.Body = self.parseBlockStatement()
-		node.DeclarationList = self.scope.declarationList
+func (self *_parser) parseFunctionBlock(async, allowAwait, allowYield bool) (body *ast.BlockStatement, declarationList []*ast.VariableDeclaration) {
+	self.openScope()
+	self.scope.inFunction = true
+	self.scope.inAsync = async
+	self.scope.allowAwait = allowAwait
+	self.scope.allowYield = allowYield
+	defer self.closeScope()
+	body = self.parseBlockStatement()
+	declarationList = self.scope.declarationList
+	return
+}
+
+func (self *_parser) parseArrowFunctionBody(async bool) (ast.ConciseBody, []*ast.VariableDeclaration) {
+	if self.token == token.LEFT_BRACE {
+		return self.parseFunctionBlock(async, async, false)
 	}
+	if async != self.scope.inAsync || async != self.scope.allowAwait {
+		inAsync := self.scope.inAsync
+		allowAwait := self.scope.allowAwait
+		self.scope.inAsync = async
+		self.scope.allowAwait = async
+		allowYield := self.scope.allowYield
+		self.scope.allowYield = false
+		defer func() {
+			self.scope.inAsync = inAsync
+			self.scope.allowAwait = allowAwait
+			self.scope.allowYield = allowYield
+		}()
+	}
+
+	return &ast.ExpressionBody{
+		Expression: self.parseAssignmentExpression(),
+	}, nil
+}
+
+func (self *_parser) parseClass(declaration bool) *ast.ClassLiteral {
+	if !self.scope.allowLet && self.token == token.CLASS {
+		self.errorUnexpectedToken(token.CLASS)
+	}
+
+	node := &ast.ClassLiteral{
+		Class: self.expect(token.CLASS),
+	}
+
+	self.tokenToBindingId()
+	var name *ast.Identifier
+	if self.token == token.IDENTIFIER {
+		name = self.parseIdentifier()
+	} else if declaration {
+		// Use expect error handling
+		self.expect(token.IDENTIFIER)
+	}
+
+	node.Name = name
+
+	if self.token != token.LEFT_BRACE {
+		self.expect(token.EXTENDS)
+		node.SuperClass = self.parseLeftHandSideExpressionAllowCall()
+	}
+
+	self.expect(token.LEFT_BRACE)
+
+	for self.token != token.RIGHT_BRACE && self.token != token.EOF {
+		if self.token == token.SEMICOLON {
+			self.next()
+			continue
+		}
+		start := self.idx
+		static := false
+		if self.token == token.STATIC {
+			switch self.peek() {
+			case token.ASSIGN, token.SEMICOLON, token.RIGHT_BRACE, token.LEFT_PARENTHESIS:
+				// treat as identifier
+			default:
+				self.next()
+				if self.token == token.LEFT_BRACE {
+					b := &ast.ClassStaticBlock{
+						Static: start,
+					}
+					b.Block, b.DeclarationList = self.parseFunctionBlock(false, true, false)
+					b.Source = self.slice(b.Block.LeftBrace, b.Block.Idx1())
+					node.Body = append(node.Body, b)
+					continue
+				}
+				static = true
+			}
+		}
+
+		var kind ast.PropertyKind
+		var async bool
+		methodBodyStart := self.idx
+		if self.literal == "get" || self.literal == "set" {
+			if tok := self.peek(); tok != token.SEMICOLON && tok != token.LEFT_PARENTHESIS {
+				if self.literal == "get" {
+					kind = ast.PropertyKindGet
+				} else {
+					kind = ast.PropertyKindSet
+				}
+				self.next()
+			}
+		} else if self.token == token.ASYNC {
+			if tok := self.peek(); tok != token.SEMICOLON && tok != token.LEFT_PARENTHESIS {
+				async = true
+				kind = ast.PropertyKindMethod
+				self.next()
+			}
+		}
+		generator := false
+		if self.token == token.MULTIPLY && (kind == "" || kind == ast.PropertyKindMethod) {
+			generator = true
+			kind = ast.PropertyKindMethod
+			self.next()
+		}
+
+		_, keyName, value, tkn := self.parseObjectPropertyKey()
+		if value == nil {
+			continue
+		}
+		computed := tkn == token.ILLEGAL
+		_, private := value.(*ast.PrivateIdentifier)
+
+		if static && !private && keyName == "prototype" {
+			self.error(value.Idx0(), "Classes may not have a static property named 'prototype'")
+		}
+
+		if kind == "" && self.token == token.LEFT_PARENTHESIS {
+			kind = ast.PropertyKindMethod
+		}
+
+		if kind != "" {
+			// method
+			if keyName == "constructor" && !computed {
+				if !static {
+					if kind != ast.PropertyKindMethod {
+						self.error(value.Idx0(), "Class constructor may not be an accessor")
+					} else if async {
+						self.error(value.Idx0(), "Class constructor may not be an async method")
+					} else if generator {
+						self.error(value.Idx0(), "Class constructor may not be a generator")
+					}
+				} else if private {
+					self.error(value.Idx0(), "Class constructor may not be a private method")
+				}
+			}
+			md := &ast.MethodDefinition{
+				Idx:      start,
+				Key:      value,
+				Kind:     kind,
+				Body:     self.parseMethodDefinition(methodBodyStart, kind, generator, async),
+				Static:   static,
+				Computed: computed,
+			}
+			node.Body = append(node.Body, md)
+		} else {
+			// field
+			isCtor := !computed && keyName == "constructor"
+			if !isCtor {
+				if name, ok := value.(*ast.PrivateIdentifier); ok {
+					isCtor = name.Name == "constructor"
+				}
+			}
+			if isCtor {
+				self.error(value.Idx0(), "Classes may not have a field named 'constructor'")
+			}
+			var initializer ast.Expression
+			if self.token == token.ASSIGN {
+				self.next()
+				initializer = self.parseExpression()
+			}
+
+			if !self.implicitSemicolon && self.token != token.SEMICOLON && self.token != token.RIGHT_BRACE {
+				self.errorUnexpectedToken(self.token)
+				break
+			}
+			node.Body = append(node.Body, &ast.FieldDefinition{
+				Idx:         start,
+				Key:         value,
+				Initializer: initializer,
+				Static:      static,
+				Computed:    computed,
+			})
+		}
+	}
+
+	node.RightBrace = self.expect(token.RIGHT_BRACE)
+	node.Source = self.slice(node.Class, node.RightBrace+1)
+
+	return node
 }
 
 func (self *_parser) parseDebuggerStatement() ast.Statement {
@@ -279,6 +501,7 @@ func (self *_parser) parseThrowStatement() ast.Statement {
 	}
 
 	node := &ast.ThrowStatement{
+		Throw:    idx,
 		Argument: self.parseExpression(),
 	}
 
@@ -288,9 +511,10 @@ func (self *_parser) parseThrowStatement() ast.Statement {
 }
 
 func (self *_parser) parseSwitchStatement() ast.Statement {
-	self.expect(token.SWITCH)
+	idx := self.expect(token.SWITCH)
 	self.expect(token.LEFT_PARENTHESIS)
 	node := &ast.SwitchStatement{
+		Switch:       idx,
 		Discriminant: self.parseExpression(),
 		Default:      -1,
 	}
@@ -306,6 +530,7 @@ func (self *_parser) parseSwitchStatement() ast.Statement {
 
 	for index := 0; self.token != token.EOF; index++ {
 		if self.token == token.RIGHT_BRACE {
+			node.RightBrace = self.idx
 			self.next()
 			break
 		}
@@ -324,11 +549,10 @@ func (self *_parser) parseSwitchStatement() ast.Statement {
 }
 
 func (self *_parser) parseWithStatement() ast.Statement {
-	self.expect(token.WITH)
+	node := &ast.WithStatement{}
+	node.With = self.expect(token.WITH)
 	self.expect(token.LEFT_PARENTHESIS)
-	node := &ast.WithStatement{
-		Object: self.parseExpression(),
-	}
+	node.Object = self.parseExpression()
 	self.expect(token.RIGHT_PARENTHESIS)
 	self.scope.allowLet = false
 	node.Body = self.parseStatement()
@@ -356,6 +580,7 @@ func (self *_parser) parseCaseStatement() *ast.CaseStatement {
 			self.token == token.DEFAULT {
 			break
 		}
+		self.scope.allowLet = true
 		node.Consequent = append(node.Consequent, self.parseStatement())
 
 	}
@@ -452,7 +677,7 @@ func (self *_parser) parseForOrForInStatement() ast.Statement {
 		if tok == token.VAR || tok == token.LET || tok == token.CONST {
 			idx := self.idx
 			self.next()
-			var list []*ast.VariableExpression
+			var list []*ast.Binding
 			if tok == token.VAR {
 				list = self.parseVarDeclarationList(idx)
 			} else {
@@ -468,24 +693,22 @@ func (self *_parser) parseForOrForInStatement() ast.Statement {
 				}
 			}
 			if forIn || forOf {
+				if list[0].Initializer != nil {
+					self.error(list[0].Initializer.Idx0(), "for-in loop variable declaration may not have an initializer")
+				}
 				if tok == token.VAR {
 					into = &ast.ForIntoVar{
 						Binding: list[0],
 					}
 				} else {
-					if list[0].Initializer != nil {
-						self.error(list[0].Initializer.Idx0(), "for-in loop variable declaration may not have an initializer")
-					}
 					into = &ast.ForDeclaration{
 						Idx:     idx,
 						IsConst: tok == token.CONST,
-						Binding: &ast.BindingIdentifier{
-							Name: list[0].Name,
-							Idx:  list[0].Idx,
-						},
+						Target:  list[0].Target,
 					}
 				}
 			} else {
+				self.ensurePatternInit(list)
 				if tok == token.VAR {
 					initializer = &ast.ForLoopInitializerVarDeclList{
 						List: list,
@@ -510,9 +733,13 @@ func (self *_parser) parseForOrForInStatement() ast.Statement {
 				forOf = true
 			}
 			if forIn || forOf {
-				switch expr.(type) {
-				case *ast.Identifier, *ast.DotExpression, *ast.BracketExpression, *ast.VariableExpression:
+				switch e := expr.(type) {
+				case *ast.Identifier, *ast.DotExpression, *ast.PrivateDotExpression, *ast.BracketExpression, *ast.Binding:
 					// These are all acceptable
+				case *ast.ObjectLiteral:
+					expr = self.reinterpretAsObjectAssignmentPattern(e)
+				case *ast.ArrayLiteral:
+					expr = self.reinterpretAsArrayAssignmentPattern(e)
 				default:
 					self.error(idx, "Invalid left-hand side in for-in or for-of")
 					self.nextStatement()
@@ -541,11 +768,23 @@ func (self *_parser) parseForOrForInStatement() ast.Statement {
 	return self.parseFor(idx, initializer)
 }
 
+func (self *_parser) ensurePatternInit(list []*ast.Binding) {
+	for _, item := range list {
+		if _, ok := item.Target.(ast.Pattern); ok {
+			if item.Initializer == nil {
+				self.error(item.Idx1(), "Missing initializer in destructuring declaration")
+				break
+			}
+		}
+	}
+}
+
 func (self *_parser) parseVariableStatement() *ast.VariableStatement {
 
 	idx := self.expect(token.VAR)
 
 	list := self.parseVarDeclarationList(idx)
+	self.ensurePatternInit(list)
 	self.semicolon()
 
 	return &ast.VariableStatement{
@@ -561,6 +800,7 @@ func (self *_parser) parseLexicalDeclaration(tok token.Token) *ast.LexicalDeclar
 	}
 
 	list := self.parseVariableDeclarationList()
+	self.ensurePatternInit(list)
 	self.semicolon()
 
 	return &ast.LexicalDeclaration{
@@ -577,8 +817,8 @@ func (self *_parser) parseDoWhileStatement() ast.Statement {
 		self.scope.inIteration = inIteration
 	}()
 
-	self.expect(token.DO)
 	node := &ast.DoWhileStatement{}
+	node.Do = self.expect(token.DO)
 	if self.token == token.LEFT_BRACE {
 		node.Body = self.parseBlockStatement()
 	} else {
@@ -589,7 +829,7 @@ func (self *_parser) parseDoWhileStatement() ast.Statement {
 	self.expect(token.WHILE)
 	self.expect(token.LEFT_PARENTHESIS)
 	node.Test = self.parseExpression()
-	self.expect(token.RIGHT_PARENTHESIS)
+	node.RightParenthesis = self.expect(token.RIGHT_PARENTHESIS)
 	if self.token == token.SEMICOLON {
 		self.next()
 	}
@@ -598,10 +838,11 @@ func (self *_parser) parseDoWhileStatement() ast.Statement {
 }
 
 func (self *_parser) parseWhileStatement() ast.Statement {
-	self.expect(token.WHILE)
+	idx := self.expect(token.WHILE)
 	self.expect(token.LEFT_PARENTHESIS)
 	node := &ast.WhileStatement{
-		Test: self.parseExpression(),
+		While: idx,
+		Test:  self.parseExpression(),
 	}
 	self.expect(token.RIGHT_PARENTHESIS)
 	node.Body = self.parseIterationStatement()
@@ -643,8 +884,6 @@ func (self *_parser) parseSourceElements() (body []ast.Statement) {
 }
 
 func (self *_parser) parseProgram() *ast.Program {
-	self.openScope()
-	defer self.closeScope()
 	prg := &ast.Program{
 		Body:            self.parseSourceElements(),
 		DeclarationList: self.scope.declarationList,
@@ -688,26 +927,14 @@ func (self *_parser) parseSourceMap() *sourcemap.Consumer {
 			b64 := urlStr[b64Index+1:]
 			data, err = base64.StdEncoding.DecodeString(b64)
 		} else {
-			var smUrl *url.URL
-			if smUrl, err = url.Parse(urlStr); err == nil {
-				p := smUrl.Path
-				if !path.IsAbs(p) {
-					baseName := self.file.Name()
-					baseUrl, err1 := url.Parse(baseName)
-					if err1 == nil && baseUrl.Scheme != "" {
-						baseUrl.Path = path.Join(path.Dir(baseUrl.Path), p)
-						p = baseUrl.String()
-					} else {
-						p = path.Join(path.Dir(baseName), p)
-					}
-				}
+			if sourceURL := file.ResolveSourcemapURL(self.file.Name(), urlStr); sourceURL != nil {
 				if self.opts.sourceMapLoader != nil {
-					data, err = self.opts.sourceMapLoader(p)
+					data, err = self.opts.sourceMapLoader(sourceURL.String())
 				} else {
-					if smUrl.Scheme == "" || smUrl.Scheme == "file" {
-						data, err = ioutil.ReadFile(p)
+					if sourceURL.Scheme == "" || sourceURL.Scheme == "file" {
+						data, err = os.ReadFile(sourceURL.Path)
 					} else {
-						err = fmt.Errorf("unsupported source map URL scheme: %s", smUrl.Scheme)
+						err = fmt.Errorf("unsupported source map URL scheme: %s", sourceURL.Scheme)
 					}
 				}
 			}
@@ -749,6 +976,7 @@ func (self *_parser) parseBreakStatement() ast.Statement {
 		}
 	}
 
+	self.tokenToBindingId()
 	if self.token == token.IDENTIFIER {
 		identifier := self.parseIdentifier()
 		if !self.scope.hasLabel(identifier.Name) {
@@ -790,6 +1018,7 @@ func (self *_parser) parseContinueStatement() ast.Statement {
 		}
 	}
 
+	self.tokenToBindingId()
 	if self.token == token.IDENTIFIER {
 		identifier := self.parseIdentifier()
 		if !self.scope.hasLabel(identifier.Name) {

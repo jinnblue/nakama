@@ -16,13 +16,15 @@ package server
 
 import (
 	"context"
-	"github.com/gofrs/uuid"
+	"strconv"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"strconv"
 )
 
 func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest) (*api.FriendList, error) {
@@ -66,9 +68,9 @@ func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest)
 		}
 	}
 
-	friends, err := ListFriends(ctx, s.logger, s.db, s.tracker, userID, limit, state, in.GetCursor())
+	friends, err := ListFriends(ctx, s.logger, s.db, s.statusRegistry, userID, limit, state, in.GetCursor())
 	if err != nil {
-		if err == ErrFriendInvalidCursor {
+		if err == runtime.ErrFriendInvalidCursor {
 			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to list friends.")
@@ -130,7 +132,7 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 
 	for _, u := range in.GetUsernames() {
 		if u == "" {
-			return nil, status.Error(codes.InvalidArgument, "Username must not be emptypb.")
+			return nil, status.Error(codes.InvalidArgument, "Username must not be empty.")
 		}
 		if username == u {
 			return nil, status.Error(codes.InvalidArgument, "Cannot add self as friend.")
@@ -151,7 +153,7 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 	allIDs = append(allIDs, in.GetIds()...)
 	allIDs = append(allIDs, userIDs...)
 
-	if err := AddFriends(ctx, s.logger, s.db, s.router, userID, username, allIDs); err != nil {
+	if err := AddFriends(ctx, s.logger, s.db, s.tracker, s.router, userID, username, allIDs); err != nil {
 		return nil, status.Error(codes.Internal, "Error while trying to add friends.")
 	}
 
@@ -210,7 +212,7 @@ func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequ
 	username := ctx.Value(ctxUsernameKey{}).(string)
 	for _, u := range in.GetUsernames() {
 		if u == "" {
-			return nil, status.Error(codes.InvalidArgument, "Username must not be emptypb.")
+			return nil, status.Error(codes.InvalidArgument, "Username must not be empty.")
 		}
 		if username == u {
 			return nil, status.Error(codes.InvalidArgument, "Cannot delete self.")
@@ -291,7 +293,7 @@ func (s *ApiServer) BlockFriends(ctx context.Context, in *api.BlockFriendsReques
 	username := ctx.Value(ctxUsernameKey{}).(string)
 	for _, u := range in.GetUsernames() {
 		if u == "" {
-			return nil, status.Error(codes.InvalidArgument, "Username must not be emptypb.")
+			return nil, status.Error(codes.InvalidArgument, "Username must not be empty.")
 		}
 		if username == u {
 			return nil, status.Error(codes.InvalidArgument, "Cannot block self.")
@@ -357,7 +359,7 @@ func (s *ApiServer) ImportFacebookFriends(ctx context.Context, in *api.ImportFac
 		return nil, status.Error(codes.InvalidArgument, "Facebook token is required.")
 	}
 
-	err := importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, ctx.Value(ctxUserIDKey{}).(uuid.UUID), ctx.Value(ctxUsernameKey{}).(string), in.Account.Token, in.Reset_ != nil && in.Reset_.Value)
+	err := importFacebookFriends(ctx, s.logger, s.db, s.tracker, s.router, s.socialClient, ctx.Value(ctxUserIDKey{}).(uuid.UUID), ctx.Value(ctxUsernameKey{}).(string), in.Account.Token, in.Reset_ != nil && in.Reset_.Value)
 	if err != nil {
 		// Already logged inside the core importFacebookFriends function.
 		return nil, err
@@ -419,7 +421,7 @@ func (s *ApiServer) ImportSteamFriends(ctx context.Context, in *api.ImportSteamF
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, "Could not authenticate Steam profile.")
 	}
-	err = importSteamFriends(ctx, s.logger, s.db, s.router, s.socialClient, userID, username, publisherKey, strconv.Itoa(int(steamProfile.SteamID)), in.Reset_ != nil && in.Reset_.Value)
+	err = importSteamFriends(ctx, s.logger, s.db, s.tracker, s.router, s.socialClient, userID, username, publisherKey, strconv.Itoa(int(steamProfile.SteamID)), in.Reset_ != nil && in.Reset_.Value)
 	if err != nil {
 		// Already logged inside the core importSteamFriends function.
 		return nil, err

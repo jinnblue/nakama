@@ -17,28 +17,26 @@ package migrate
 import (
 	"database/sql"
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"net/url"
 	"os"
-	"path"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx"
-	_ "github.com/jackc/pgx/stdlib" // Blank import to register SQL driver
+	"github.com/heroiclabs/nakama/v3/server"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgerrcode"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	migrate "github.com/rubenv/sql-migrate"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-
-	"github.com/heroiclabs/nakama/v3/server"
 )
 
 const (
-	dbErrorDatabaseDoesNotExist = "3D000"
-	dbErrorDuplicateDatabase    = "42P04"
+	dbErrorDatabaseDoesNotExist = pgerrcode.InvalidCatalogName
 	migrationTable              = "migration_info"
 	dialect                     = "postgres"
 	defaultLimit                = -1
@@ -58,7 +56,7 @@ type migrationService struct {
 	dbAddress    string
 	limit        int
 	loggerFormat server.LoggingFormat
-	migrations   *migrate.AssetMigrationSource
+	migrations   *migrate.EmbedFileSystemMigrationSource
 	db           *sql.DB
 }
 
@@ -66,25 +64,9 @@ func StartupCheck(logger *zap.Logger, db *sql.DB) {
 	migrate.SetTable(migrationTable)
 	migrate.SetIgnoreUnknown(true)
 
-	ms := &migrate.AssetMigrationSource{
-		Asset: func(_path string) ([]byte, error) {
-			f, err := sqlMigrateFS.Open(path.Join("sql", _path))
-			if err != nil {
-				return nil, err
-			}
-			return ioutil.ReadAll(f)
-		},
-		AssetDir: func(_path string) ([]string, error) {
-			entries, err := sqlMigrateFS.ReadDir(path.Join("sql", _path))
-			if err != nil {
-				return nil, err
-			}
-			files := make([]string, 0, len(entries))
-			for _, dirEntry := range entries {
-				files = append(files, dirEntry.Name())
-			}
-			return files, nil
-		},
+	ms := &migrate.EmbedFileSystemMigrationSource{
+		FileSystem: sqlMigrateFS,
+		Root:       "sql",
 	}
 
 	migrations, err := ms.FindMigrations()
@@ -113,25 +95,9 @@ func Parse(args []string, tmpLogger *zap.Logger) {
 	migrate.SetTable(migrationTable)
 	migrate.SetIgnoreUnknown(true)
 	ms := &migrationService{
-		migrations: &migrate.AssetMigrationSource{
-			Asset: func(_path string) ([]byte, error) {
-				f, err := sqlMigrateFS.Open(path.Join("sql", _path))
-				if err != nil {
-					return nil, err
-				}
-				return ioutil.ReadAll(f)
-			},
-			AssetDir: func(_path string) ([]string, error) {
-				entries, err := sqlMigrateFS.ReadDir(path.Join("sql", _path))
-				if err != nil {
-					return nil, err
-				}
-				files := make([]string, 0, len(entries))
-				for _, dirEntry := range entries {
-					files = append(files, dirEntry.Name())
-				}
-				return files, nil
-			},
+		migrations: &migrate.EmbedFileSystemMigrationSource{
+			FileSystem: sqlMigrateFS,
+			Root:       "sql",
 		},
 	}
 
@@ -162,8 +128,16 @@ func Parse(args []string, tmpLogger *zap.Logger) {
 		logger.Fatal("Bad connection URL", zap.Error(err))
 	}
 	query := parsedURL.Query()
+	var queryUpdated bool
 	if len(query.Get("sslmode")) == 0 {
 		query.Set("sslmode", "prefer")
+		queryUpdated = true
+	}
+	//if len(query.Get("statement_cache_mode")) == 0 {
+	//	query.Set("statement_cache_mode", "describe")
+	//	queryUpdated = true
+	//}
+	if queryUpdated {
 		parsedURL.RawQuery = query.Encode()
 	}
 
@@ -185,39 +159,47 @@ func Parse(args []string, tmpLogger *zap.Logger) {
 		logger.Fatal("Failed to open database", zap.Error(err))
 	}
 
-	var dbVersion string
-	if err = db.QueryRow("SELECT version()").Scan(&dbVersion); err != nil {
-		if e, ok := err.(pgx.PgError); ok && e.Code == dbErrorDatabaseDoesNotExist {
-			// Database does not exist, try to create a new one
-			logger.Info("Creating new database", zap.String("name", dbname))
-			db.Close()
-			// Connect to anonymous db
-			parsedURL.Path = ""
-			db, err = sql.Open("pgx", parsedURL.String())
-			if err != nil {
-				logger.Fatal("Failed to open database", zap.Error(err))
-			}
-			if _, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s", dbname)); err != nil {
-				db.Close()
-				logger.Fatal("Failed to create database", zap.Error(err))
-			}
-			db.Close()
-			parsedURL.Path = fmt.Sprintf("/%s", dbname)
-			db, err = sql.Open("pgx", parsedURL.String())
-			if err != nil {
-				db.Close()
-				logger.Fatal("Failed to open database", zap.Error(err))
-			}
-			// Reattempt to get database version
-			if err = db.QueryRow("SELECT version()").Scan(&dbVersion); err != nil {
-				db.Close()
-				logger.Fatal("Error querying database version", zap.Error(err))
-			}
+	var nakamaDBExists bool
+	if err = db.QueryRow("SELECT EXISTS (SELECT 1 from pg_database WHERE datname = $1)", dbname).Scan(&nakamaDBExists); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == dbErrorDatabaseDoesNotExist {
+			nakamaDBExists = false
 		} else {
 			db.Close()
-			logger.Fatal("Error querying database version", zap.Error(err))
+			logger.Fatal("Failed to check if db exists", zap.String("db", dbname), zap.Error(err))
 		}
 	}
+
+	if !nakamaDBExists {
+		// Database does not exist, create it
+		logger.Info("Creating new database", zap.String("name", dbname))
+		db.Close()
+		// Connect to anonymous db
+		parsedURL.Path = ""
+		db, err = sql.Open("pgx", parsedURL.String())
+		if err != nil {
+			logger.Fatal("Failed to open database", zap.Error(err))
+		}
+		if _, err = db.Exec(fmt.Sprintf("CREATE DATABASE %q", dbname)); err != nil {
+			db.Close()
+			logger.Fatal("Failed to create database", zap.Error(err))
+		}
+		db.Close()
+		parsedURL.Path = fmt.Sprintf("/%s", dbname)
+		db, err = sql.Open("pgx", parsedURL.String())
+		if err != nil {
+			db.Close()
+			logger.Fatal("Failed to open database", zap.Error(err))
+		}
+	}
+
+	// Get database version
+	var dbVersion string
+	if err = db.QueryRow("SELECT version()").Scan(&dbVersion); err != nil {
+		db.Close()
+		logger.Fatal("Error querying database version", zap.Error(err))
+	}
+
 	logger.Info("Database information", zap.String("version", dbVersion))
 
 	if err = db.Ping(); err != nil {
@@ -229,7 +211,6 @@ func Parse(args []string, tmpLogger *zap.Logger) {
 
 	exec(logger)
 	db.Close()
-	os.Exit(0)
 }
 
 func (ms *migrationService) up(logger *zap.Logger) {

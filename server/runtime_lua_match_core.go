@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 	"github.com/heroiclabs/nakama/v3/social"
@@ -58,13 +58,14 @@ type RuntimeLuaMatchCore struct {
 	leaveFn       lua.LValue
 	loopFn        lua.LValue
 	terminateFn   lua.LValue
+	signalFn      lua.LValue
 	ctx           *lua.LTable
 	dispatcher    *lua.LTable
 
 	ctxCancelFn context.CancelFunc
 }
 
-func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, matchRegistry MatchRegistry, tracker Tracker, streamManager StreamManager, router MessageRouter, stdLibs map[string]lua.LGFunction, once *sync.Once, localCache *RuntimeLuaLocalCache, eventFn RuntimeEventCustomFunction, sharedReg, sharedGlobals *lua.LTable, id uuid.UUID, node string, stopped *atomic.Bool, name string, matchProvider *MatchProvider) (RuntimeMatchCore, error) {
+func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, stdLibs map[string]lua.LGFunction, once *sync.Once, localCache *RuntimeLuaLocalCache, eventFn RuntimeEventCustomFunction, sharedReg, sharedGlobals *lua.LTable, id uuid.UUID, node string, stopped *atomic.Bool, name string, matchProvider *MatchProvider, storageIndex StorageIndex) (RuntimeMatchCore, error) {
 	// Set up the Lua VM that will handle this match.
 	vm := lua.NewState(lua.Options{
 		CallStackSize:       config.GetRuntime().GetLuaCallStackSize(),
@@ -94,7 +95,7 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, proto
 			vm.Call(1, 0)
 		}
 
-		nakamaModule := NewRuntimeLuaNakamaModule(logger, db, protojsonMarshaler, protojsonUnmarshaler, config, socialClient, leaderboardCache, rankCache, leaderboardScheduler, sessionRegistry, sessionCache, matchRegistry, tracker, streamManager, router, once, localCache, matchProvider.CreateMatch, eventFn, nil, nil)
+		nakamaModule := NewRuntimeLuaNakamaModule(logger, db, protojsonMarshaler, protojsonUnmarshaler, config, version, socialClient, leaderboardCache, rankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router, once, localCache, storageIndex, matchProvider.CreateMatch, eventFn, nil, nil)
 		vm.PreloadModule("nakama", nakamaModule.Loader)
 	}
 
@@ -158,6 +159,11 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, proto
 		ctxCancelFn()
 		return nil, errors.New("match_terminate not found or not a function")
 	}
+	signalFn := tab.RawGet(lua.LString("match_signal"))
+	if signalFn.Type() != lua.LTFunction {
+		ctxCancelFn()
+		return nil, errors.New("match_signal not found or not a function")
+	}
 
 	core := &RuntimeLuaMatchCore{
 		logger:        logger,
@@ -188,6 +194,7 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, proto
 		leaveFn:       leaveFn,
 		loopFn:        loopFn,
 		terminateFn:   terminateFn,
+		signalFn:      signalFn,
 		ctx:           ctx,
 		// dispatcher set below.
 
@@ -253,6 +260,9 @@ func (r *RuntimeLuaMatchCore) MatchInit(presenceList *MatchPresenceList, deferMe
 	state := r.vm.Get(-1)
 	if state.Type() == LTSentinel {
 		return nil, 0, errors.New("match_init returned unexpected first value, must be a state")
+	}
+	if state.Type() == lua.LTNil {
+		return nil, 0, ErrMatchInitStateNil
 	}
 	r.vm.Pop(1)
 
@@ -548,6 +558,45 @@ func (r *RuntimeLuaMatchCore) MatchTerminate(tick int64, state interface{}, grac
 	return newState, nil
 }
 
+func (r *RuntimeLuaMatchCore) MatchSignal(tick int64, state interface{}, data string) (interface{}, string, error) {
+	// Execute the match_terminate call.
+	r.vm.Push(LSentinel)
+	r.vm.Push(r.signalFn)
+	r.vm.Push(r.ctx)
+	r.vm.Push(r.dispatcher)
+	r.vm.Push(lua.LNumber(tick))
+	r.vm.Push(state.(lua.LValue))
+	r.vm.Push(lua.LString(data))
+
+	err := r.vm.PCall(5, lua.MultRet, nil)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Extract the resulting response data.
+	responseData := r.vm.Get(-1)
+	var responseDataString string
+	if responseData.Type() == lua.LTString {
+		responseDataString = responseData.String()
+	} else if responseData.Type() != lua.LTNil {
+		return nil, "", errors.New("Match signal returned non-string result, stopping match")
+	}
+	r.vm.Pop(1)
+	// Extract the resulting state.
+	newState := r.vm.Get(-1)
+	if newState.Type() == lua.LTNil || newState.Type() == LTSentinel {
+		return nil, "", nil
+	}
+	r.vm.Pop(1)
+	// Check for and remove the sentinel value, will fail if there are any extra return values.
+	if sentinel := r.vm.Get(-1); sentinel.Type() != LTSentinel {
+		return nil, "", errors.New("Match signal returned too many values, stopping match")
+	}
+	r.vm.Pop(1)
+
+	return newState, responseDataString, nil
+}
+
 func (r *RuntimeLuaMatchCore) GetState(state interface{}) (string, error) {
 	stateBytes, err := json.Marshal(RuntimeLuaConvertLuaValue(state.(lua.LValue)))
 	if err != nil {
@@ -574,6 +623,9 @@ func (r *RuntimeLuaMatchCore) CreateTime() int64 {
 
 func (r *RuntimeLuaMatchCore) Cancel() {
 	r.ctxCancelFn()
+}
+
+func (r *RuntimeLuaMatchCore) Cleanup() {
 	r.vm.Close()
 }
 

@@ -1,7 +1,7 @@
 ![Nakama](.github/logo.png?raw=true "Nakama logo")
 ======
 
-[![GitHub release](https://img.shields.io/github/release/heroiclabs/nakama.svg)](https://heroiclabs.com/docs/nakama-download/)
+[![GitHub release](https://img.shields.io/github/release/heroiclabs/nakama.svg)](https://heroiclabs.com/docs/nakama/getting-started/install/)
 [![Forum](https://img.shields.io/badge/forum-online-success.svg)](https://forum.heroiclabs.com)
 [![License](https://img.shields.io/github/license/heroiclabs/nakama.svg)](https://github.com/heroiclabs/nakama/blob/master/LICENSE)
 
@@ -17,6 +17,8 @@
 * **Leaderboards** - Dynamic, seasonal, get top members, or members around a user. Have as many as you need.
 * **Tournaments** - Invite players to compete together over prizes. Link many together to create leagues.
 * **Parties** - Add team play to a game. Users can form a party and communicate with party members.
+* **Purchase Validation** - Validate in-app purchases and subscriptions.
+* **In-App Notifications** - Send messages and notifications to connected client sockets.
 * **Runtime code** - Extend the server with custom logic written in Lua, TypeScript/JavaScript, or native Go code.
 * **Matchmaker**, **dashboard**, **metrics**, and [more](https://heroiclabs.com/docs).
 
@@ -32,11 +34,11 @@ The server is simple to setup and run for local development and can be deployed 
 
 The fastest way to run the server and the database is with Docker. Setup Docker and start the daemon.
 
-1. Set up a [docker-compose file](https://heroiclabs.com/docs/install-docker-quickstart/#using-docker-compose) and place it in a folder for your project.
+1. Set up a [docker-compose file](https://heroiclabs.com/docs/nakama/getting-started/install/docker/#running-nakama) and place it in a folder for your project.
 
 2. Run `docker-compose -f ./docker-compose.yml up` to download container images and run the servers.
 
-For more detailed instructions have a look at our [Docker quickstart](https://heroiclabs.com/docs/install-docker-quickstart) guide.
+For more detailed instructions have a look at our [Docker quickstart](https://heroiclabs.com/docs/nakama/getting-started/install/docker) guide.
 
 Nakama Docker images are maintained on [Docker Hub](https://hub.docker.com/r/heroiclabs/nakama/tags) and [prerelease](https://hub.docker.com/r/heroiclabs/nakama-prerelease/tags) images are occasionally published for cutting edge features of the server.
 
@@ -60,7 +62,7 @@ You can run the servers with native binaries for your platform.
    nakama --database.address "root@127.0.0.1:26257"
    ```
 
-When connected you'll see server output which describes all settings the server uses for [configuration](https://heroiclabs.com/docs/install-configuration).
+When connected you'll see server output which describes all settings the server uses for [configuration](https://heroiclabs.com/docs/nakama/getting-started/configuration).
 
 > {"level":"info","ts":"2018-04-29T10:14:41.249+0100","msg":"Node","name":"nakama","version":"2.0.0+7e18b09","runtime":"go1.10.1","cpu":4} <br/>
 > {"level":"info","ts":"2018-04-29T10:14:41.249+0100","msg":"Database connections","dsns":["root@127.0.0.1:26257"]} <br/>
@@ -167,6 +169,17 @@ To build the codebase and generate all sources follow these steps.
    ```shell
    go build -trimpath -mod=vendor
    ```
+
+### Testing
+
+In order to run all the unit and integration tests run:
+
+```shell
+docker-compose -f ./docker-compose-tests.yml up --build --abort-on-container-exit; docker-compose -f ./docker-compose-tests.yml down -v
+```
+
+This will create an isolated environment with Nakama and database instances, run
+all the tests, and drop the environment afterwards.
 
 ### License
 

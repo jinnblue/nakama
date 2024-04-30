@@ -18,7 +18,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
+	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -31,7 +32,22 @@ type statusEvent struct {
 	leaves []*rtapi.UserPresence
 }
 
-type StatusRegistry struct {
+var _ StatusRegistry = (*LocalStatusRegistry)(nil)
+
+type StatusRegistry interface {
+	Stop()
+	Follow(sessionID uuid.UUID, userIDs map[uuid.UUID]struct{})
+	Unfollow(sessionID uuid.UUID, userIDs []uuid.UUID)
+	UnfollowAll(sessionID uuid.UUID)
+	IsOnline(userID uuid.UUID) bool
+	FillOnlineUsers(users []*api.User)
+	FillOnlineAccounts(accounts []*api.Account)
+	FillOnlineFriends(friends []*api.Friend)
+	FillOnlineGroupUsers(groupUsers []*api.GroupUserList_GroupUser)
+	Queue(userID uuid.UUID, joins, leaves []*rtapi.UserPresence)
+}
+
+type LocalStatusRegistry struct {
 	sync.RWMutex
 	logger             *zap.Logger
 	sessionRegistry    SessionRegistry
@@ -43,12 +59,15 @@ type StatusRegistry struct {
 	eventsCh  chan *statusEvent
 	bySession map[uuid.UUID]map[uuid.UUID]struct{}
 	byUser    map[uuid.UUID]map[uuid.UUID]struct{}
+
+	onlineMutex *sync.RWMutex
+	onlineCache map[uuid.UUID]map[string]struct{}
 }
 
-func NewStatusRegistry(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, protojsonMarshaler *protojson.MarshalOptions) *StatusRegistry {
+func NewLocalStatusRegistry(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, protojsonMarshaler *protojson.MarshalOptions) StatusRegistry {
 	ctx, ctxCancelFn := context.WithCancel(context.Background())
 
-	s := &StatusRegistry{
+	s := &LocalStatusRegistry{
 		logger:             logger,
 		sessionRegistry:    sessionRegistry,
 		protojsonMarshaler: protojsonMarshaler,
@@ -57,8 +76,11 @@ func NewStatusRegistry(logger *zap.Logger, config Config, sessionRegistry Sessio
 		ctxCancelFn: ctxCancelFn,
 
 		eventsCh:  make(chan *statusEvent, config.GetTracker().EventQueueSize),
-		bySession: make(map[uuid.UUID]map[uuid.UUID]struct{}), // session ID to user IDs
-		byUser:    make(map[uuid.UUID]map[uuid.UUID]struct{}), // user ID to session IDs
+		bySession: make(map[uuid.UUID]map[uuid.UUID]struct{}), // Session ID to user IDs they follow.
+		byUser:    make(map[uuid.UUID]map[uuid.UUID]struct{}), // User ID to session IDs that follow them.
+
+		onlineMutex: &sync.RWMutex{},
+		onlineCache: make(map[uuid.UUID]map[string]struct{}), // User ID to their own session IDs they have a status on.
 	}
 
 	go func() {
@@ -67,6 +89,29 @@ func NewStatusRegistry(logger *zap.Logger, config Config, sessionRegistry Sessio
 			case <-s.ctx.Done():
 				return
 			case e := <-s.eventsCh:
+				// Track overall user online status.
+				s.onlineMutex.Lock()
+				existing, found := s.onlineCache[e.userID]
+				for _, leave := range e.leaves {
+					if !found {
+						continue
+					}
+					delete(existing, leave.SessionId)
+				}
+				for _, join := range e.joins {
+					if !found {
+						existing = make(map[string]struct{}, 1)
+						s.onlineCache[e.userID] = existing
+						found = true
+					}
+					existing[join.SessionId] = struct{}{}
+				}
+				if found && len(existing) == 0 {
+					delete(s.onlineCache, e.userID)
+				}
+				s.onlineMutex.Unlock()
+
+				// Process status update if the user has any followers.
 				s.RLock()
 				ids, hasFollowers := s.byUser[e.userID]
 				if !hasFollowers {
@@ -74,7 +119,7 @@ func NewStatusRegistry(logger *zap.Logger, config Config, sessionRegistry Sessio
 					continue
 				}
 				sessionIDs := make([]uuid.UUID, 0, len(ids))
-				for id, _ := range ids {
+				for id := range ids {
 					sessionIDs = append(sessionIDs, id)
 				}
 				s.RUnlock()
@@ -132,11 +177,11 @@ func NewStatusRegistry(logger *zap.Logger, config Config, sessionRegistry Sessio
 	return s
 }
 
-func (s *StatusRegistry) Stop() {
+func (s *LocalStatusRegistry) Stop() {
 	s.ctxCancelFn()
 }
 
-func (s *StatusRegistry) Follow(sessionID uuid.UUID, userIDs map[uuid.UUID]struct{}) {
+func (s *LocalStatusRegistry) Follow(sessionID uuid.UUID, userIDs map[uuid.UUID]struct{}) {
 	if len(userIDs) == 0 {
 		return
 	}
@@ -148,7 +193,7 @@ func (s *StatusRegistry) Follow(sessionID uuid.UUID, userIDs map[uuid.UUID]struc
 		sessionFollows = make(map[uuid.UUID]struct{})
 		s.bySession[sessionID] = sessionFollows
 	}
-	for userID, _ := range userIDs {
+	for userID := range userIDs {
 		if _, alreadyFollowing := sessionFollows[userID]; alreadyFollowing {
 			continue
 		}
@@ -169,7 +214,7 @@ func (s *StatusRegistry) Follow(sessionID uuid.UUID, userIDs map[uuid.UUID]struc
 	s.Unlock()
 }
 
-func (s *StatusRegistry) Unfollow(sessionID uuid.UUID, userIDs []uuid.UUID) {
+func (s *LocalStatusRegistry) Unfollow(sessionID uuid.UUID, userIDs []uuid.UUID) {
 	if len(userIDs) == 0 {
 		return
 	}
@@ -208,7 +253,7 @@ func (s *StatusRegistry) Unfollow(sessionID uuid.UUID, userIDs []uuid.UUID) {
 	s.Unlock()
 }
 
-func (s *StatusRegistry) UnfollowAll(sessionID uuid.UUID) {
+func (s *LocalStatusRegistry) UnfollowAll(sessionID uuid.UUID) {
 	s.Lock()
 
 	sessionFollows, ok := s.bySession[sessionID]
@@ -216,7 +261,7 @@ func (s *StatusRegistry) UnfollowAll(sessionID uuid.UUID) {
 		s.Unlock()
 		return
 	}
-	for userID, _ := range sessionFollows {
+	for userID := range sessionFollows {
 		if userFollowers := s.byUser[userID]; len(userFollowers) == 1 {
 			delete(s.byUser, userID)
 		} else {
@@ -228,7 +273,66 @@ func (s *StatusRegistry) UnfollowAll(sessionID uuid.UUID) {
 	s.Unlock()
 }
 
-func (s *StatusRegistry) Queue(userID uuid.UUID, joins, leaves []*rtapi.UserPresence) {
+func (s *LocalStatusRegistry) IsOnline(userID uuid.UUID) bool {
+	s.onlineMutex.RLock()
+	_, found := s.onlineCache[userID]
+	s.onlineMutex.RUnlock()
+	return found
+}
+
+func (s *LocalStatusRegistry) FillOnlineUsers(users []*api.User) {
+	if len(users) == 0 {
+		return
+	}
+
+	s.onlineMutex.RLock()
+	for _, user := range users {
+		_, found := s.onlineCache[uuid.FromStringOrNil(user.Id)]
+		user.Online = found
+	}
+	s.onlineMutex.RUnlock()
+}
+
+func (s *LocalStatusRegistry) FillOnlineAccounts(accounts []*api.Account) {
+	if len(accounts) == 0 {
+		return
+	}
+
+	s.onlineMutex.RLock()
+	for _, account := range accounts {
+		_, found := s.onlineCache[uuid.FromStringOrNil(account.User.Id)]
+		account.User.Online = found
+	}
+	s.onlineMutex.RUnlock()
+}
+
+func (s *LocalStatusRegistry) FillOnlineFriends(friends []*api.Friend) {
+	if len(friends) == 0 {
+		return
+	}
+
+	s.onlineMutex.RLock()
+	for _, friend := range friends {
+		_, found := s.onlineCache[uuid.FromStringOrNil(friend.User.Id)]
+		friend.User.Online = found
+	}
+	s.onlineMutex.RUnlock()
+}
+
+func (s *LocalStatusRegistry) FillOnlineGroupUsers(groupUsers []*api.GroupUserList_GroupUser) {
+	if len(groupUsers) == 0 {
+		return
+	}
+
+	s.onlineMutex.RLock()
+	for _, groupUser := range groupUsers {
+		_, found := s.onlineCache[uuid.FromStringOrNil(groupUser.User.Id)]
+		groupUser.User.Online = found
+	}
+	s.onlineMutex.RUnlock()
+}
+
+func (s *LocalStatusRegistry) Queue(userID uuid.UUID, joins, leaves []*rtapi.UserPresence) {
 	s.eventsCh <- &statusEvent{
 		userID: userID,
 		joins:  joins,

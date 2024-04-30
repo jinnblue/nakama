@@ -15,12 +15,13 @@
 package server
 
 import (
+	"testing"
+
 	"github.com/dop251/goja"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
-	"testing"
 )
 
 func TestJsLoggerInfo(t *testing.T) {
@@ -32,7 +33,7 @@ func TestJsLoggerInfo(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'info';
@@ -58,7 +59,7 @@ func TestJsLoggerWarn(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'warn';
@@ -84,7 +85,7 @@ func TestJsLoggerError(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'error';
@@ -110,7 +111,7 @@ func TestJsLoggerDebug(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'debug';
@@ -136,7 +137,7 @@ func TestJsLoggerWithField(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'info';
@@ -163,13 +164,13 @@ func TestJsLoggerWithFields(t *testing.T) {
 	if err != nil {
 		t.Error("Failed to instantiate jsLogger")
 	}
-	r.Set("logger", jsLoggerInst)
+	_ = r.Set("logger", jsLoggerInst)
 
 	SCRIPT := `
 var s = 'info';
 
 var l1 = logger.withField('logger', 'l1');
-var l2 = logger.withFields({'logger': 'l2', n: 1});
+var l2 = logger.withFields({logger: 'l2', n: 1});
 l1.info('logger one')
 l2.info('logger two')
 `
@@ -187,8 +188,9 @@ l2.info('logger two')
 
 	secondLog := logs.All()[1]
 	assert.Equal(t, secondLog.Message, "logger two")
-	assert.EqualValues(t, []zap.Field{
-		{Key: "logger", String: "l2", Type: zapcore.StringType},
-		{Key: "n", Integer: 1, Type: zapcore.Int64Type},
-	}, secondLog.Context)
+	assert.Len(t, secondLog.Context, 2)
+	assert.Contains(t, secondLog.Context,
+		zap.Field{Key: "logger", String: "l2", Type: zapcore.StringType})
+	assert.Contains(t, secondLog.Context,
+		zap.Field{Key: "n", Integer: 1, Type: zapcore.Int64Type})
 }

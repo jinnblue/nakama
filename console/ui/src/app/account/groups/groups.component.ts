@@ -14,12 +14,14 @@
 
 import {Component, Injectable, OnInit} from '@angular/core';
 import {
-  ApiAccount, ApiUserGroupList,
+  ApiAccount, ApiUser, ApiUserGroupList,
   ConsoleService, UserGroupListUserGroup,
-  UserRole} from '../../console.service';
+  UserRole
+} from '../../console.service';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, Router, RouterStateSnapshot} from '@angular/router';
 import {AuthenticationService} from '../../authentication.service';
 import {Observable} from 'rxjs';
+import {DeleteConfirmService} from '../../shared/delete-confirm.service';
 
 @Component({
   templateUrl: './groups.component.html',
@@ -35,6 +37,7 @@ export class GroupsComponent implements OnInit {
     private readonly router: Router,
     private readonly consoleService: ConsoleService,
     private readonly authService: AuthenticationService,
+    private readonly deleteConfirmService: DeleteConfirmService,
   ) {}
 
   ngOnInit(): void {
@@ -56,20 +59,28 @@ export class GroupsComponent implements OnInit {
       });
   }
 
-  deleteAllowed() {
+  deleteAllowed(): boolean {
     return this.authService.sessionRole <= UserRole.USER_ROLE_MAINTAINER;
   }
 
-  deleteGroupUser(event, i: number, f: UserGroupListUserGroup) {
-    event.target.disabled = true;
-    event.preventDefault();
-    this.error = '';
-    this.consoleService.deleteGroupUser('', this.account.user.id, f.group.id).subscribe(() => {
-      this.error = '';
-      this.groups.splice(i, 1)
-    }, err => {
-      this.error = err;
-    })
+  deleteGroupUser(event, i: number, f: UserGroupListUserGroup): void {
+    this.deleteConfirmService.openDeleteConfirmModal(
+      () => {
+        event.target.disabled = true;
+        event.preventDefault();
+        this.error = '';
+        this.consoleService.deleteGroupUser('', this.account.user.id, f.group.id).subscribe(() => {
+          this.error = '';
+          this.groups.splice(i, 1)
+        }, err => {
+          this.error = err;
+        });
+      }
+    );
+  }
+
+  viewAccount(g: UserGroupListUserGroup): void {
+    this.router.navigate(['/groups', g.group.id], {relativeTo: this.route});
   }
 }
 

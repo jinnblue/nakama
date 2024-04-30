@@ -16,7 +16,8 @@ package server
 
 import (
 	"context"
-	"github.com/gofrs/uuid"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -231,7 +232,7 @@ func (s *ApiServer) LinkFacebook(ctx context.Context, in *api.LinkFacebookReques
 		return nil, status.Error(codes.InvalidArgument, "Facebook access token is required.")
 	}
 
-	err := LinkFacebook(ctx, s.logger, s.db, s.socialClient, s.router, userID, username, s.config.GetSocial().FacebookLimitedLogin.AppId, in.Account.Token, in.Sync == nil || in.Sync.Value)
+	err := LinkFacebook(ctx, s.logger, s.db, s.socialClient, s.tracker, s.router, userID, username, s.config.GetSocial().FacebookLimitedLogin.AppId, in.Account.Token, in.Sync == nil || in.Sync.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +413,11 @@ func (s *ApiServer) LinkSteam(ctx context.Context, in *api.LinkSteamRequest) (*e
 		}
 	}
 
-	err := LinkSteam(ctx, s.logger, s.db, s.config, s.socialClient, s.router, userID, username, in.Account.Token, in.Sync == nil || in.Sync.Value)
+	if in == nil || in.Account == nil || in.Account.Token == "" {
+		return nil, status.Error(codes.InvalidArgument, "Steam access token is required.")
+	}
+
+	err := LinkSteam(ctx, s.logger, s.db, s.config, s.socialClient, s.tracker, s.router, userID, username, in.Account.Token, in.Sync == nil || in.Sync.Value)
 	if err != nil {
 		return nil, err
 	}

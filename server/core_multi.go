@@ -20,24 +20,20 @@ import (
 
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
+	pgx "github.com/jackc/pgx/v4"
 	"go.uber.org/zap"
 )
 
-func MultiUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, accountUpdates []*accountUpdate, storageWrites StorageOpWrites, walletUpdates []*walletUpdate, updateLedger bool) ([]*api.StorageObjectAck, []*runtime.WalletUpdateResult, error) {
-	if len(accountUpdates) == 0 && len(storageWrites) == 0 && len(walletUpdates) == 0 {
+func MultiUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, metrics Metrics, accountUpdates []*accountUpdate, storageWrites StorageOpWrites, storageDeletes StorageOpDeletes, storageIndex StorageIndex, walletUpdates []*walletUpdate, updateLedger bool) ([]*api.StorageObjectAck, []*runtime.WalletUpdateResult, error) {
+	if len(accountUpdates) == 0 && len(storageWrites) == 0 && len(storageDeletes) == 0 && len(walletUpdates) == 0 {
 		return nil, nil, nil
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return nil, nil, err
-	}
-
 	var storageWriteAcks []*api.StorageObjectAck
+	var storageWriteOps StorageOpWrites
 	var walletUpdateResults []*runtime.WalletUpdateResult
 
-	if err = ExecuteInTx(ctx, tx, func() error {
+	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
 		storageWriteAcks = nil
 		walletUpdateResults = nil
 
@@ -48,9 +44,15 @@ func MultiUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, accountUpd
 		}
 
 		// Execute any storage updates.
-		storageWriteAcks, updateErr = storageWriteObjects(ctx, logger, tx, true, storageWrites)
+		storageWriteOps, storageWriteAcks, updateErr = storageWriteObjects(ctx, logger, metrics, tx, true, storageWrites)
 		if updateErr != nil {
 			return updateErr
+		}
+
+		// Execute any storage deletes.
+		deleteErr := storageDeleteObjects(ctx, logger, tx, true, storageDeletes)
+		if deleteErr != nil {
+			return deleteErr
 		}
 
 		// Execute any wallet updates.
@@ -67,6 +69,10 @@ func MultiUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, accountUpd
 		logger.Error("Error running multi update.", zap.Error(err))
 		return nil, walletUpdateResults, err
 	}
+
+	// Update storage index.
+	storageIndexWrite(ctx, storageIndex, storageWriteOps, storageWriteAcks)
+	storageIndex.Delete(ctx, storageDeletes)
 
 	return storageWriteAcks, walletUpdateResults, nil
 }

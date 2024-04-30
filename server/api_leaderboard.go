@@ -18,14 +18,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func (s *ApiServer) DeleteLeaderboardRecord(ctx context.Context, in *api.DeleteLeaderboardRecordRequest) (*emptypb.Empty, error) {
@@ -58,13 +58,15 @@ func (s *ApiServer) DeleteLeaderboardRecord(ctx context.Context, in *api.DeleteL
 		return nil, status.Error(codes.InvalidArgument, "Invalid leaderboard ID.")
 	}
 
-	err := LeaderboardRecordDelete(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, userID, in.LeaderboardId, userID.String())
-	if err == ErrLeaderboardNotFound {
-		return nil, status.Error(codes.NotFound, "Leaderboard not found.")
-	} else if err == ErrLeaderboardAuthoritative {
-		return nil, status.Error(codes.PermissionDenied, "Leaderboard only allows authoritative score deletions.")
-	} else if err != nil {
-		return nil, status.Error(codes.Internal, "Error deleting score from leaderboard.")
+	if err := LeaderboardRecordDelete(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, userID, in.LeaderboardId, userID.String()); err != nil {
+		switch err {
+		case ErrLeaderboardNotFound:
+			return nil, status.Error(codes.NotFound, "Leaderboard not found.")
+		case ErrLeaderboardAuthoritative:
+			return nil, status.Error(codes.PermissionDenied, "Leaderboard only allows authoritative score deletions.")
+		default:
+			return nil, status.Error(codes.Internal, "Error deleting score from leaderboard.")
+		}
 	}
 
 	// After hook.
@@ -110,8 +112,8 @@ func (s *ApiServer) ListLeaderboardRecords(ctx context.Context, in *api.ListLead
 
 	var limit *wrapperspb.Int32Value
 	if in.GetLimit() != nil {
-		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
-			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 1000 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 1000.")
 		}
 		limit = in.GetLimit()
 	} else if len(in.GetOwnerIds()) == 0 || in.GetCursor() != "" {
@@ -132,12 +134,15 @@ func (s *ApiServer) ListLeaderboardRecords(ctx context.Context, in *api.ListLead
 	}
 
 	records, err := LeaderboardRecordsList(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.LeaderboardId, limit, in.Cursor, in.OwnerIds, overrideExpiry)
-	if err == ErrLeaderboardNotFound {
-		return nil, status.Error(codes.NotFound, "Leaderboard not found.")
-	} else if err == ErrLeaderboardInvalidCursor {
-		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
-	} else if err != nil {
-		return nil, status.Error(codes.Internal, "Error listing records from leaderboard.")
+	if err != nil {
+		switch err {
+		case ErrLeaderboardNotFound:
+			return nil, status.Error(codes.NotFound, "Leaderboard not found.")
+		case ErrLeaderboardInvalidCursor:
+			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
+		default:
+			return nil, status.Error(codes.Internal, "Error listing records from leaderboard.")
+		}
 	}
 
 	// After hook.
@@ -262,24 +267,22 @@ func (s *ApiServer) ListLeaderboardRecordsAroundOwner(ctx context.Context, in *a
 		overrideExpiry = in.Expiry.Value
 	}
 
-	records, err := LeaderboardRecordsHaystack(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetLeaderboardId(), ownerID, limit, overrideExpiry)
+	records, err := LeaderboardRecordsHaystack(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetLeaderboardId(), in.Cursor, ownerID, limit, overrideExpiry)
 	if err == ErrLeaderboardNotFound {
 		return nil, status.Error(codes.NotFound, "Leaderboard not found.")
 	} else if err != nil {
 		return nil, status.Error(codes.Internal, "Error querying records from leaderboard.")
 	}
 
-	recordList := &api.LeaderboardRecordList{Records: records}
-
 	// After hook.
 	if fn := s.runtime.AfterListLeaderboardRecordsAroundOwner(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, recordList, in)
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, records, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
 		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return recordList, nil
+	return records, nil
 }

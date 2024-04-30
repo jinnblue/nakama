@@ -30,8 +30,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
+	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -42,6 +42,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/encoding/gzip" // enable gzip compression on server for grpc
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -66,20 +67,25 @@ type ApiServer struct {
 	logger               *zap.Logger
 	db                   *sql.DB
 	config               Config
+	version              string
 	socialClient         *social.Client
+	storageIndex         StorageIndex
 	leaderboardCache     LeaderboardCache
 	leaderboardRankCache LeaderboardRankCache
 	sessionCache         SessionCache
+	sessionRegistry      SessionRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
 	tracker              Tracker
 	router               MessageRouter
-	metrics              *Metrics
+	streamManager        StreamManager
+	metrics              Metrics
 	runtime              *Runtime
 	grpcServer           *grpc.Server
 	grpcGatewayServer    *http.Server
 }
 
-func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, metrics *Metrics, pipeline *Pipeline, runtime *Runtime) *ApiServer {
+func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, storageIndex StorageIndex, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, pipeline *Pipeline, runtime *Runtime) *ApiServer {
 	var gatewayContextTimeoutMs string
 	if config.GetSocket().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -91,7 +97,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	}
 
 	serverOpts := []grpc.ServerOption{
-		grpc.StatsHandler(&MetricsGrpcHandler{metrics: metrics}),
+		grpc.StatsHandler(&MetricsGrpcHandler{MetricsFn: metrics.Api}),
 		grpc.MaxRecvMsgSize(int(config.GetSocket().MaxRequestSizeBytes)),
 		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 			ctx, err := securityInterceptorFunc(logger, config, sessionCache, ctx, req, info)
@@ -110,13 +116,18 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 		logger:               logger,
 		db:                   db,
 		config:               config,
+		version:              version,
 		socialClient:         socialClient,
 		leaderboardCache:     leaderboardCache,
 		leaderboardRankCache: leaderboardRankCache,
+		storageIndex:         storageIndex,
 		sessionCache:         sessionCache,
+		sessionRegistry:      sessionRegistry,
+		statusRegistry:       statusRegistry,
 		matchRegistry:        matchRegistry,
 		tracker:              tracker,
 		router:               router,
+		streamManager:        streamManager,
 		metrics:              metrics,
 		runtime:              runtime,
 		grpcServer:           grpcServer,
@@ -189,7 +200,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 		cert := credentials.NewTLS(&tls.Config{RootCAs: certPool, InsecureSkipVerify: true})
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(cert))
 	} else {
-		dialOpts = append(dialOpts, grpc.WithInsecure())
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 	if err := apigrpc.RegisterNakamaHandlerFromEndpoint(ctx, grpcGateway, dialAddr, dialOpts); err != nil {
 		startupLogger.Fatal("API server gateway registration failed", zap.Error(err))
@@ -246,13 +257,30 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	CORSMethods := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "DELETE"})
 	handlerWithCORS := handlers.CORS(CORSHeaders, CORSOrigins, CORSMethods)(grpcGatewayRouter)
 
+	// Enable configured response headers, if any are set. Do not override values that may have been set by server processing.
+	optionalResponseHeaderHandler := handlerWithCORS
+	if headers := config.GetSocket().Headers; len(headers) > 0 {
+		optionalResponseHeaderHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Preemptively set custom response headers. Further processing will override them if needed for proper functionality.
+			wHeaders := w.Header()
+			for key, value := range headers {
+				if wHeaders.Get(key) == "" {
+					wHeaders.Set(key, value)
+				}
+			}
+
+			// Allow core server processing to handle the request.
+			handlerWithCORS.ServeHTTP(w, r)
+		})
+	}
+
 	// Set up and start GRPC Gateway server.
 	s.grpcGatewayServer = &http.Server{
 		ReadTimeout:    time.Millisecond * time.Duration(int64(config.GetSocket().ReadTimeoutMs)),
 		WriteTimeout:   time.Millisecond * time.Duration(int64(config.GetSocket().WriteTimeoutMs)),
 		IdleTimeout:    time.Millisecond * time.Duration(int64(config.GetSocket().IdleTimeoutMs)),
 		MaxHeaderBytes: 5120,
-		Handler:        handlerWithCORS,
+		Handler:        optionalResponseHeaderHandler,
 	}
 	if config.GetSocket().TLSCert != nil {
 		s.grpcGatewayServer.TLSConfig = &tls.Config{Certificates: config.GetSocket().TLSCert}
@@ -375,12 +403,12 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache Ses
 			// Value of "authorization" or "grpc-authorization" was empty or repeated.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		userID, username, vars, exp, token, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
+		userID, username, vars, exp, tokenId, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
 		if !ok {
 			// Value of "authorization" or "grpc-authorization" was malformed or expired.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		if !sessionCache.IsValidSession(userID, exp, token) {
+		if !sessionCache.IsValidSession(userID, exp, tokenId) {
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
 		ctx = context.WithValue(context.WithValue(context.WithValue(context.WithValue(ctx, ctxUserIDKey{}, userID), ctxUsernameKey{}, username), ctxVarsKey{}, vars), ctxExpiryKey{}, exp)
@@ -403,12 +431,12 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache Ses
 			// Value of "authorization" or "grpc-authorization" was empty or repeated.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		userID, username, vars, exp, token, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
+		userID, username, vars, exp, tokenId, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
 		if !ok {
 			// Value of "authorization" or "grpc-authorization" was malformed or expired.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		if !sessionCache.IsValidSession(userID, exp, token) {
+		if !sessionCache.IsValidSession(userID, exp, tokenId) {
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
 		ctx = context.WithValue(context.WithValue(context.WithValue(context.WithValue(ctx, ctxUserIDKey{}, userID), ctxUsernameKey{}, username), ctxVarsKey{}, vars), ctxExpiryKey{}, exp)
@@ -436,7 +464,7 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 	return cs[:s], cs[s+1:], true
 }
 
-func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, username string, vars map[string]string, exp int64, token string, ok bool) {
+func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, username string, vars map[string]string, exp int64, tokenId string, ok bool) {
 	if auth == "" {
 		return
 	}
@@ -447,7 +475,7 @@ func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, user
 	return parseToken(hmacSecretByte, auth[len(prefix):])
 }
 
-func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, username string, vars map[string]string, exp int64, token string, ok bool) {
+func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, username string, vars map[string]string, exp int64, tokenId string, ok bool) {
 	jwtToken, err := jwt.ParseWithClaims(tokenString, &SessionTokenClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if s, ok := token.Method.(*jwt.SigningMethodHMAC); !ok || s.Hash != crypto.SHA256 {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -465,7 +493,7 @@ func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, us
 	if err != nil {
 		return
 	}
-	return userID, claims.Username, claims.Vars, claims.ExpiresAt, tokenString, true
+	return userID, claims.Username, claims.Vars, claims.ExpiresAt, claims.TokenId, true
 }
 
 func decompressHandler(logger *zap.Logger, h http.Handler) http.HandlerFunc {
@@ -498,7 +526,7 @@ func extractClientAddressFromContext(logger *zap.Logger, ctx context.Context) (s
 		clientAddr = peerInfo.Addr.String()
 	}
 
-	return extractClientAddress(logger, clientAddr)
+	return extractClientAddress(logger, clientAddr, ctx, "context")
 }
 
 func extractClientAddressFromRequest(logger *zap.Logger, r *http.Request) (string, string) {
@@ -509,10 +537,10 @@ func extractClientAddressFromRequest(logger *zap.Logger, r *http.Request) (strin
 		clientAddr = r.RemoteAddr
 	}
 
-	return extractClientAddress(logger, clientAddr)
+	return extractClientAddress(logger, clientAddr, r, "request")
 }
 
-func extractClientAddress(logger *zap.Logger, clientAddr string) (string, string) {
+func extractClientAddress(logger *zap.Logger, clientAddr string, source interface{}, sourceType string) (string, string) {
 	var clientIP, clientPort string
 
 	if clientAddr != "" {
@@ -535,10 +563,17 @@ func extractClientAddress(logger *zap.Logger, clientAddr string) (string, string
 		// At this point err may still be a non-nil value that's not a *net.AddrError, ignore the address.
 	}
 
+	if clientIP == "" {
+		if r, isRequest := source.(*http.Request); isRequest {
+			source = map[string]interface{}{"headers": r.Header, "remote_addr": r.RemoteAddr}
+		}
+		logger.Warn("cannot extract client address", zap.String("address_source_type", sourceType), zap.Any("address_source", source))
+	}
+
 	return clientIP, clientPort
 }
 
-func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics *Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) error {
+func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) error {
 	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
 	start := time.Now()
 
@@ -550,7 +585,7 @@ func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics *Metrics, f
 	return err
 }
 
-func traceApiAfter(ctx context.Context, logger *zap.Logger, metrics *Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) {
+func traceApiAfter(ctx context.Context, logger *zap.Logger, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) {
 	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
 	start := time.Now()
 
